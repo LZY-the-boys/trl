@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+import dataclasses
+import inspect
 import warnings
+from functools import wraps
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -28,25 +30,21 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from transformers.modeling_utils import unwrap_model
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
 
 from ..import_utils import is_peft_available
-from .utils import ConstantLengthDataset
+from .utils import (
+    ConstantLengthDataset,
+    DataCollatorForCompletionOnlyLM,
+    PeftSavingCallback,
+    neftune_post_forward_hook,
+)
 
 
 if is_peft_available():
-    from peft import PeftConfig, PeftModel, get_peft_model, prepare_model_for_int8_training
-
-
-class PeftSavingCallback(TrainerCallback):
-    def on_save(self, args, state, control, **kwargs):
-        if args.should_save:
-            checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
-            kwargs["model"].save_pretrained(checkpoint_path)
-
-            if "pytorch_model.bin" in os.listdir(checkpoint_path):
-                os.remove(os.path.join(checkpoint_path, "pytorch_model.bin"))
+    from peft import PeftConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
 
 class SFTTrainer(Trainer):
@@ -96,10 +94,20 @@ class SFTTrainer(Trainer):
             The number of sequences to use for the `ConstantLengthDataset`. Defaults to `1024`.
         chars_per_token (`Optional[float]`):
             The number of characters per token to use for the `ConstantLengthDataset`. Defaults to `3.6`. You can check how this is computed in the
-            stack-llama example: https://github.com/lvwerra/trl/blob/08f550674c553c36c51d1027613c29f14f3676a5/examples/stack_llama/scripts/supervised_finetuning.py#L53.
+            stack-llama example: https://github.com/huggingface/trl/blob/08f550674c553c36c51d1027613c29f14f3676a5/examples/stack_llama/scripts/supervised_finetuning.py#L53.
         packing (`Optional[bool]`):
             Used only in case `dataset_text_field` is passed. This argument is used by the `ConstantLengthDataset` to pack the sequences
             of the dataset.
+        dataset_num_proc (`Optional[int]`):
+            The number of workers to use to tokenize the data. Only used when `packing=False`. Defaults to None.
+        dataset_batch_size (`int`):
+            The number of examples to tokenize per batch. If batch_size <= 0 or batch_size == None,
+            tokenize the full dataset as a single batch. Defaults to 1000.
+        neftune_noise_alpha (`Optional[float]`):
+            If not `None`, this will activate NEFTune noise embeddings. This has been proven to drastically improve model performances for instrcution
+            fine-tuning. Check out the original paper here: https://arxiv.org/abs/2310.05914 and the original code here: https://github.com/neelsjain/NEFTune
+        model_init_kwargs: (`Optional[Dict]`, *optional*):
+            Dict of Optional kwargs to pass when instantiating the model from a string
     """
 
     def __init__(
@@ -115,7 +123,7 @@ class SFTTrainer(Trainer):
         callbacks: Optional[List[TrainerCallback]] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
-        peft_config: Optional[Dict] = None,
+        peft_config: Optional["PeftConfig"] = None,
         dataset_text_field: Optional[str] = None,
         packing: Optional[bool] = False,
         formatting_func: Optional[Callable] = None,
@@ -123,11 +131,26 @@ class SFTTrainer(Trainer):
         infinite: Optional[bool] = False,
         num_of_sequences: Optional[int] = 1024,
         chars_per_token: Optional[float] = 3.6,
+        dataset_num_proc: Optional[int] = None,
+        dataset_batch_size: int = 1000,
+        neftune_noise_alpha: Optional[float] = None,
+        model_init_kwargs: Optional[Dict] = None,
     ):
+        if model_init_kwargs is None:
+            model_init_kwargs = {}
+        elif not isinstance(model, str):
+            raise ValueError("You passed model_kwargs to the SFTTrainer. But your model is already instantiated.")
+
         if isinstance(model, str):
             warnings.warn(
                 "You passed a model_id to the SFTTrainer. This will automatically create an "
                 "`AutoModelForCausalLM` or a `PeftModel` (if you passed a `peft_config`) for you."
+            )
+            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+
+        if packing and data_collator is not None and isinstance(data_collator, DataCollatorForCompletionOnlyLM):
+            raise ValueError(
+                "You passed a `DataCollatorForCompletionOnlyLM` to the SFTTrainer. This is not compatible with the `packing` argument."
             )
 
         if is_peft_available() and peft_config is not None:
@@ -138,20 +161,36 @@ class SFTTrainer(Trainer):
                 )
 
             if not isinstance(model, PeftModel):
-                if not isinstance(model, PreTrainedModel):
-                    model = AutoModelForCausalLM.from_pretrained(
-                        model,
+                if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False):
+                    _support_gc_kwargs = hasattr(
+                        args, "gradient_checkpointing_kwargs"
+                    ) and "gradient_checkpointing_kwargs" in list(
+                        inspect.signature(prepare_model_for_kbit_training).parameters
                     )
 
-                if getattr(model, "is_loaded_in_8bit", False):
-                    model = prepare_model_for_int8_training(model)
+                    preprare_model_kwargs = {"use_gradient_checkpointing": args.gradient_checkpointing}
+
+                    if _support_gc_kwargs:
+                        preprare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
+
+                    model = prepare_model_for_kbit_training(model, **preprare_model_kwargs)
+
+                    args = dataclasses.replace(args, gradient_checkpointing=False)
+                elif getattr(args, "gradient_checkpointing", False):
+                    # For backward compatibility with older versions of transformers
+                    if hasattr(model, "enable_input_require_grads"):
+                        model.enable_input_require_grads()
+                    else:
+
+                        def make_inputs_require_grad(module, input, output):
+                            output.requires_grad_(True)
+
+                        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
                 model = get_peft_model(model, peft_config)
 
             if callbacks is None:
                 callbacks = [PeftSavingCallback]
-        elif not isinstance(model, PreTrainedModel):
-            model = AutoModelForCausalLM.from_pretrained(model)
 
         if tokenizer is None:
             tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path)
@@ -165,6 +204,20 @@ class SFTTrainer(Trainer):
             warnings.warn(
                 f"You didn't pass a `max_seq_length` argument to the SFTTrainer, this will default to {max_seq_length}"
             )
+
+        self.dataset_num_proc = dataset_num_proc
+        self.dataset_batch_size = dataset_batch_size
+
+        self._trainer_supports_neftune = hasattr(args, "neftune_noise_alpha")
+
+        if neftune_noise_alpha is not None and self._trainer_supports_neftune:
+            args.neftune_noise_alpha = neftune_noise_alpha
+            warnings.warn(
+                "You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override the one in the `TrainingArguments`."
+            )
+            # self.neftune_noise_alpha is done at Trainer level
+        elif not self._trainer_supports_neftune:
+            self.neftune_noise_alpha = neftune_noise_alpha
 
         if not packing:
             if dataset_text_field is None and formatting_func is None:
@@ -200,6 +253,12 @@ class SFTTrainer(Trainer):
                 chars_per_token,
             )
 
+        if tokenizer.padding_side is not None and tokenizer.padding_side != "right":
+            warnings.warn(
+                "You passed a tokenizer with `padding_side` not equal to `right` to the SFTTrainer. This might lead to some unexpected behaviour due to "
+                "overflow issues when training a model in half-precision. You might consider adding `tokenizer.padding_side = 'right'` to your code."
+            )
+
         super().__init__(
             model=model,
             args=args,
@@ -214,6 +273,36 @@ class SFTTrainer(Trainer):
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
 
+        if self.args.max_steps > 0 and packing:
+            warnings.warn(
+                "You passed `packing=True` to the SFTTrainer, and you are training your model with `max_steps` strategy. The dataset will be iterated until the `max_steps` are reached."
+            )
+            self.train_dataset.infinite = True
+        elif self.args.max_steps == -1 and packing:
+            self.train_dataset.infinite = False
+
+    @wraps(Trainer.train)
+    def train(self, *args, **kwargs):
+        # Activate neftune right before training.
+        if self.neftune_noise_alpha is not None and not self._trainer_supports_neftune:
+            self.model = self._trl_activate_neftune(self.model)
+
+        output = super().train(*args, **kwargs)
+
+        # After training we make sure to retrieve back the original forward pass method
+        # for the embedding layer by removing the forward post hook.
+        if self.neftune_noise_alpha is not None and not self._trainer_supports_neftune:
+            unwrapped_model = unwrap_model(self.model)
+            if is_peft_available() and isinstance(unwrapped_model, PeftModel):
+                embeddings = unwrapped_model.base_model.model.get_input_embeddings()
+            else:
+                embeddings = unwrapped_model.get_input_embeddings()
+
+            self.neftune_hook_handle.remove()
+            del embeddings.neftune_noise_alpha
+
+        return output
+
     def _prepare_dataset(
         self,
         dataset,
@@ -226,31 +315,25 @@ class SFTTrainer(Trainer):
         num_of_sequences,
         chars_per_token,
     ):
+        if dataset is None:
+            raise ValueError("The dataset should not be None")
+
         # check if torch dataset / dataloader and do nothing
-        if dataset is not None and (
-            isinstance(
-                dataset,
-                (torch.utils.data.IterableDataset, torch.utils.data.Dataset),
-            )
-        ):
-            is_already_dataset = True
-        else:
-            is_already_dataset = False
+        if isinstance(dataset, (torch.utils.data.IterableDataset, torch.utils.data.Dataset, ConstantLengthDataset)):
+            return dataset
 
         if not packing:
-            dataset = self._prepare_non_packed_dataloader(
+            return self._prepare_non_packed_dataloader(
                 tokenizer, dataset, dataset_text_field, max_seq_length, formatting_func
             )
 
-            is_already_dataset = True
-
-        if not is_already_dataset and (dataset_text_field is not None or formatting_func is not None):
+        if dataset_text_field is not None or formatting_func is not None:
             if tokenizer is None:
                 raise ValueError(
                     "You need to pass a tokenizer when using the SFT Trainer when passing a `dataset_text_field`."
                 )
 
-            dataset = ConstantLengthDataset(
+            return ConstantLengthDataset(
                 tokenizer,
                 dataset,
                 dataset_text_field=dataset_text_field,
@@ -262,39 +345,59 @@ class SFTTrainer(Trainer):
                 eos_token_id=tokenizer.eos_token_id,
             )
 
-        elif not is_already_dataset and (dataset_text_field is None and formatting_func is None):
-            raise ValueError(
-                "You need to pass a `dataset_text_field` or `formatting_func` argument to the SFTTrainer if you want to use the `ConstantLengthDataset`."
-            )
-
-        return dataset
+        raise ValueError(
+            "You need to pass a `dataset_text_field` or `formatting_func` argument to the SFTTrainer if you want to use the `ConstantLengthDataset`."
+        )
 
     def _prepare_non_packed_dataloader(
         self, tokenizer, dataset, dataset_text_field, max_seq_len, formatting_func=None
     ):
         use_formatting_func = formatting_func is not None and dataset_text_field is None
+        self._dataset_sanity_checked = False
 
         # Inspired from: https://huggingface.co/learn/nlp-course/chapter7/6?fw=pt
         def tokenize(element):
             outputs = tokenizer(
                 element[dataset_text_field] if not use_formatting_func else formatting_func(element),
                 truncation=True,
+                padding=False,
                 max_length=max_seq_len,
                 return_overflowing_tokens=False,
-                return_length=True,
+                return_length=False,
             )
-            input_batch = []
-            for length, input_ids in zip(outputs["length"], outputs["input_ids"]):
-                if length == max_seq_len:
-                    input_batch.append(input_ids)
 
-            if len(input_batch) == 0:
-                # warn users
-                warnings.warn(
-                    f"Found 0 samples with a length of {max_seq_len}. You might want to decrease the `max_seq_len` argument."
-                )
-            return {"input_ids": input_batch}
+            if use_formatting_func and not self._dataset_sanity_checked:
+                if not isinstance(formatting_func(element), list):
+                    raise ValueError(
+                        "The `formatting_func` should return a list of processed strings since it can lead to silent bugs."
+                    )
+                else:
+                    self._dataset_sanity_checked = True
 
-        tokenized_dataset = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+            return {"input_ids": outputs["input_ids"], "attention_mask": outputs["attention_mask"]}
+
+        tokenized_dataset = dataset.map(
+            tokenize,
+            batched=True,
+            remove_columns=dataset.column_names,
+            num_proc=self.dataset_num_proc,
+            batch_size=self.dataset_batch_size,
+        )
 
         return tokenized_dataset
+
+    def _trl_activate_neftune(self, model):
+        r"""
+        Activates the neftune as presented in this code: https://github.com/neelsjain/NEFTune and paper: https://arxiv.org/abs/2310.05914
+        Since in transformers Trainer we do have an `_activate_neftune` method, we need to rename this method to avoid conflicts.
+        """
+        unwrapped_model = unwrap_model(model)
+        if is_peft_available() and isinstance(unwrapped_model, PeftModel):
+            embeddings = unwrapped_model.base_model.model.get_input_embeddings()
+        else:
+            embeddings = unwrapped_model.get_input_embeddings()
+
+        embeddings.neftune_noise_alpha = self.neftune_noise_alpha
+        hook_handle = embeddings.register_forward_hook(neftune_post_forward_hook)
+        self.neftune_hook_handle = hook_handle
+        return model

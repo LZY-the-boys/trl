@@ -20,9 +20,11 @@ import torch
 import torch.nn as nn
 from accelerate import Accelerator
 from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError, HFValidationError, LocalEntryNotFoundError
+from safetensors.torch import load_file as safe_load_file
 from transformers import PreTrainedModel
 
-from ..import_utils import is_peft_available
+from ..import_utils import is_peft_available, is_transformers_greater_than, is_xpu_available
 
 
 if is_peft_available():
@@ -31,9 +33,15 @@ if is_peft_available():
         PeftModel,
         PeftModelForCausalLM,
         PeftModelForSeq2SeqLM,
+        PromptLearningConfig,
         get_peft_model,
-        prepare_model_for_int8_training,
+        prepare_model_for_kbit_training,
     )
+
+if is_transformers_greater_than("4.33.0"):
+    from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+else:
+    from transformers.deepspeed import is_deepspeed_zero3_enabled
 
 LAYER_PATTERNS = [
     "transformer.h.{layer}",
@@ -60,13 +68,16 @@ class PreTrainedModelWrapper(nn.Module):
     transformers_parent_class = None
     supported_args = None
     supported_modules = ("v_head",)
+    supported_rm_modules = ("score",)
     supported_pretrained_model_architectures = (
         (PreTrainedModel)
         if not is_peft_available()
         else (PreTrainedModel, PeftModelForCausalLM, PeftModelForSeq2SeqLM)
     )
 
-    def __init__(self, pretrained_model=None, **kwargs):
+    def __init__(
+        self, pretrained_model=None, score_module=None, supports_rm_adapter=False, rm_adapter_name=None, **kwargs
+    ):
         super().__init__()
         self.pretrained_model = pretrained_model
 
@@ -81,6 +92,12 @@ class PreTrainedModelWrapper(nn.Module):
 
         if hasattr(pretrained_model, "gradient_checkpointing_enable"):
             self.gradient_checkpointing_enable = pretrained_model.gradient_checkpointing_enable
+
+        self.supports_rm_adapter = supports_rm_adapter
+        self.rm_adapter_name = rm_adapter_name
+        self.policy_adapter_name = "default"
+        if score_module is not None:
+            self.score = score_module
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
@@ -103,21 +120,31 @@ class PreTrainedModelWrapper(nn.Module):
                 `from_pretrained` method. We also pre-process the kwargs to extract
                 the arguments that are specific to the `transformers.PreTrainedModel`
                 class and the arguments that are specific to trl models. The kwargs
-                also support `prepare_model_for_int8_training` arguments from
+                also support `prepare_model_for_kbit_training` arguments from
                 `peft` library.
         """
         if kwargs is not None:
             peft_config = kwargs.pop("peft_config", None)
+            reward_adapter = kwargs.pop("reward_adapter", None)
+            reward_adapter_name = kwargs.pop("reward_adapter_name", "reward_adapter")
             is_trainable = kwargs.pop("is_trainable", False)
             trl_model_args, pretrained_kwargs, peft_quantization_kwargs = cls._split_kwargs(kwargs)
+            token = pretrained_kwargs.get("token", None)
         else:
             peft_config = None
             is_trainable = False
             trl_model_args = {}
             pretrained_kwargs = {}
             peft_quantization_kwargs = {}
+            token = None
+
+        if reward_adapter is not None and not isinstance(reward_adapter, str):
+            raise ValueError(
+                "The `reward_adapter` argument should be a string representing the name of local path or the Hub id to the Reward Modeling adapter."
+            )
 
         is_peft_model = False
+
         current_device = cls._get_current_device()
         if isinstance(pretrained_model_name_or_path, str):
             is_loaded_in_8bit = pretrained_kwargs["load_in_8bit"] if "load_in_8bit" in pretrained_kwargs else False
@@ -144,56 +171,70 @@ class PreTrainedModelWrapper(nn.Module):
         if isinstance(pretrained_model_name_or_path, str):
             if is_peft_available():
                 try:
-                    peft_filename = hf_hub_download(pretrained_model_name_or_path, "adapter_config.json")
-                except:  # noqa
-                    peft_filename = None
+                    # If there is a trained peft adapter in the hub, load its config.
+                    remote_adapter_config = hf_hub_download(
+                        pretrained_model_name_or_path,
+                        "adapter_config.json",
+                        token=token,
+                    )
+                except (EntryNotFoundError, LocalEntryNotFoundError, HFValidationError):
+                    remote_adapter_config = None
             else:
-                peft_filename = None
+                remote_adapter_config = None
 
-            # Dealing with `peft` case:
-            # 1- check if `adapter_config` has been saved in the hub or locally
-            # 2- if yes, load the `peft` config
-            # 3- use the config to load the `transformers` model and then load the `peft` model
-            if (
-                os.path.exists(pretrained_model_name_or_path)
-                and ("adapter_config.json" in os.listdir(pretrained_model_name_or_path) or peft_filename is not None)
-                and is_peft_available()
-            ):
-                if peft_filename is not None:
-                    peft_config = PeftConfig.from_pretrained(peft_filename)
+            local_adapter_present = os.path.exists(os.path.join(pretrained_model_name_or_path, "adapter_config.json"))
+
+            if (local_adapter_present or remote_adapter_config is not None) and is_peft_available():
+                if peft_config is not None:
+                    logging.warning(
+                        "`peft_config` argument ignored since a peft config file was found in "
+                        f"{pretrained_model_name_or_path}"
+                    )
+
+                # Load the trained peft adapter config
+                if local_adapter_present:
+                    trained_adapter_config = PeftConfig.from_pretrained(pretrained_model_name_or_path)
                 else:
-                    peft_config = PeftConfig.from_pretrained(pretrained_model_name_or_path)
+                    remote_adapter_dir = os.path.dirname(remote_adapter_config)
+                    trained_adapter_config = PeftConfig.from_pretrained(remote_adapter_dir)
 
+                # Load the pretrained base model
                 pretrained_model = cls.transformers_parent_class.from_pretrained(
-                    peft_config.base_model_name_or_path, *model_args, **pretrained_kwargs
+                    trained_adapter_config.base_model_name_or_path, *model_args, **pretrained_kwargs
                 )
 
+                # Wrap the pretrained model with the trained peft adapter
                 pretrained_model = PeftModel.from_pretrained(
                     pretrained_model, pretrained_model_name_or_path, is_trainable=is_trainable
                 )
+                logging.info("Trained peft adapter loaded")
             else:
                 pretrained_model = cls.transformers_parent_class.from_pretrained(
                     pretrained_model_name_or_path, *model_args, **pretrained_kwargs
                 )
 
                 if peft_config is not None:
+                    # Initialize a new peft adapter with the given config
                     if is_loaded_in_8bit or is_loaded_in_4bit:
-                        pretrained_model = prepare_model_for_int8_training(
+                        pretrained_model = prepare_model_for_kbit_training(
                             pretrained_model,
                             **peft_quantization_kwargs,
                         )
                     pretrained_model = get_peft_model(pretrained_model, peft_config)
+                    logging.info("peft adapter initialised")
 
         elif isinstance(pretrained_model_name_or_path, cls.supported_pretrained_model_architectures):
             pretrained_model = pretrained_model_name_or_path
 
             if peft_config is not None and isinstance(pretrained_model, PreTrainedModel):
+                # Initialize a new peft adapter with the given config
                 if is_loaded_in_8bit or is_loaded_in_4bit:
-                    pretrained_model = prepare_model_for_int8_training(
+                    pretrained_model = prepare_model_for_kbit_training(
                         pretrained_model,
                         **peft_quantization_kwargs,
                     )
                 pretrained_model = get_peft_model(pretrained_model, peft_config)
+                logging.info("peft adapter initialised")
         else:
             raise ValueError(
                 "pretrained_model_name_or_path should be a string or a PreTrainedModel, "
@@ -203,54 +244,81 @@ class PreTrainedModelWrapper(nn.Module):
         if is_peft_available():
             if isinstance(pretrained_model, PeftModel):
                 is_peft_model = True
+                # for backward compatibility
+                if hasattr(pretrained_model, "active_peft_config") and isinstance(
+                    pretrained_model.active_peft_config, PromptLearningConfig
+                ):
+                    raise ValueError("PromptLearningConfig is not supported for PPO training.")
+
+        # Add reward modeling adapter if specified
+        if not is_peft_model and reward_adapter is not None:
+            raise ValueError("reward_adapter can only be used with a PeftModel. ")
+        elif is_peft_model and reward_adapter is not None:
+            score_module = cls.add_and_load_reward_modeling_adapter(
+                pretrained_model, reward_adapter, reward_adapter_name, token=token
+            )
+            multi_adapter_args = {
+                "score_module": score_module,
+                "supports_rm_adapter": True,
+                "rm_adapter_name": reward_adapter_name,
+            }
+        else:
+            multi_adapter_args = {"supports_rm_adapter": False}
+
         # Then, create the full model by instantiating the wrapper class
-        model = cls(pretrained_model, **trl_model_args)
+        model = cls(pretrained_model, **multi_adapter_args, **trl_model_args)
 
         # if resume_training, load the state_dict again - this is ok since the
         # state_dict is removed from the model after loading it.
         is_resuming_training = True
         if isinstance(pretrained_model_name_or_path, str):
+            safe_filename = os.path.join(pretrained_model_name_or_path, "model.safetensors")
             filename = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin")
-            sharded_index_filename = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin.index.json")
-            is_shared = False
 
-            if not os.path.exists(filename):
-                try:
-                    filename = hf_hub_download(pretrained_model_name_or_path, "pytorch_model.bin")
-                # sharded
-                except:  # noqa
-                    if os.path.exists(sharded_index_filename):
-                        index_file_name = sharded_index_filename
-                    else:
-                        try:
-                            index_file_name = hf_hub_download(
-                                pretrained_model_name_or_path, "pytorch_model.bin.index.json"
-                            )
-                        except ValueError:  # not continue training, do not have v_head weight
-                            is_resuming_training = False
-                            logging.warning(
-                                f"A {type(pretrained_model)} model is loaded from '{pretrained_model_name_or_path}', "
-                                f"and no v_head weight is found. This IS expected if you are not resuming PPO training."
-                            )
-                    # load json
-                    if is_resuming_training:
-                        with open(index_file_name, "r") as f:
-                            index = json.load(f)
-                        # check filename with `v_head` or any known extra module:
-                        files_to_download = set()
-                        for k, v in index["weight_map"].items():
-                            if any([module in k for module in cls.supported_modules]):
-                                files_to_download.add(v)
-                        is_shared = True
+            sharded_index_filename = os.path.join(pretrained_model_name_or_path, "pytorch_model.bin.index.json")
+            safe_sharded_index_filename = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
+            is_sharded = False
+            use_safe = os.path.exists(safe_filename)
+
+            if not (os.path.exists(filename) or os.path.exists(safe_filename)):
+                # Try with `pytorch_model.bin`
+                filename, files_to_download, is_sharded, is_resuming_training = cls._get_checkpoint_from_hub(
+                    pretrained_model,
+                    pretrained_model_name_or_path,
+                    sharded_index_filename,
+                    token=token,
+                )
+                # Try with safetensors
+                if filename is None and files_to_download is None:
+                    safe_filename, files_to_download, is_sharded, is_resuming_training = cls._get_checkpoint_from_hub(
+                        pretrained_model,
+                        pretrained_model_name_or_path,
+                        safe_sharded_index_filename,
+                        token=token,
+                        model_name="model.safetensors",
+                        model_index_name="model.safetensors.index.json",
+                    )
+                    use_safe = True
+                else:
+                    use_safe = False
+
+            loading_func = safe_load_file if use_safe else torch.load
+            load_kwargs = {} if use_safe else {"map_location": "cpu"}
+
             if is_resuming_training:
-                if is_shared:
+                if is_sharded:
                     # download each file and add it to the state_dict
                     state_dict = {}
+
                     for shard_file in files_to_download:
-                        filename = hf_hub_download(pretrained_model_name_or_path, shard_file)
-                        state_dict.update(torch.load(filename, map_location="cpu"))
+                        filename = hf_hub_download(
+                            pretrained_model_name_or_path,
+                            shard_file,
+                            token=token,
+                        )
+                        state_dict.update(loading_func(filename, **load_kwargs))
                 else:
-                    state_dict = torch.load(filename, map_location="cpu")
+                    state_dict = loading_func(filename if not use_safe else safe_filename, **load_kwargs)
 
         else:
             state_dict = pretrained_model_name_or_path.state_dict()
@@ -264,19 +332,72 @@ class PreTrainedModelWrapper(nn.Module):
         return model
 
     @classmethod
+    def _get_checkpoint_from_hub(
+        cls,
+        pretrained_model,
+        pretrained_model_name_or_path,
+        index_filename,
+        token=None,
+        model_name="pytorch_model.bin",
+        model_index_name="pytorch_model.bin.index.json",
+    ):
+        files_to_download = None
+        filename = None
+        is_resuming_training = True
+        is_sharded = False
+
+        try:
+            filename = hf_hub_download(
+                pretrained_model_name_or_path,
+                model_name,
+                token=token,
+            )
+        # sharded
+        except (EntryNotFoundError, LocalEntryNotFoundError, HFValidationError):
+            if os.path.exists(index_filename):
+                index_file_name = index_filename
+            else:
+                try:
+                    index_file_name = hf_hub_download(
+                        pretrained_model_name_or_path,
+                        model_index_name,
+                        token=token,
+                    )
+                except (EntryNotFoundError, LocalEntryNotFoundError, HFValidationError):
+                    # not continue training, do not have v_head weight
+                    is_resuming_training = False
+                    logging.warning(
+                        f"A {type(pretrained_model)} model is loaded from '{pretrained_model_name_or_path}', "
+                        f"and no v_head weight is found. This IS expected if you are not resuming PPO training."
+                    )
+            # load json
+            if is_resuming_training:
+                with open(index_file_name, "r") as f:
+                    index = json.load(f)
+                # check filename with `v_head` or any known extra module:
+                files_to_download = set()
+                for k, v in index["weight_map"].items():
+                    if any([module in k for module in cls.supported_modules]):
+                        files_to_download.add(v)
+                is_sharded = True
+
+        return filename, files_to_download, is_sharded, is_resuming_training
+
+    @classmethod
     def _get_current_device(cls):
         r"""
-        Get the current device using the `Accelerate` object - We just return the
-        process index of the `Accelerate` object to handle corner cases when running scripts
-        in distributed setups.
+        Get the current device. For GPU, we return the local process index using the `Accelerator`
+        object to handle corner cases when running scripts in distributed environments.
 
         Returns:
-            current_device (`int`):
-                The current device index.
+            current_device (`Union[int, str]`):
+                The current device.
         """
         dummy_accelerator = Accelerator()
-        current_device = dummy_accelerator.process_index
-        return current_device
+        if is_xpu_available():
+            return f"xpu:{dummy_accelerator.local_process_index}"
+        else:
+            return dummy_accelerator.local_process_index if torch.cuda.is_available() else "cpu"
 
     @classmethod
     def _split_kwargs(cls, kwargs):
@@ -287,7 +408,7 @@ class PreTrainedModelWrapper(nn.Module):
         check_peft_kwargs = False
 
         if is_peft_available():
-            from peft import prepare_model_for_int8_training
+            from peft import prepare_model_for_kbit_training
 
             check_peft_kwargs = True
 
@@ -302,12 +423,68 @@ class PreTrainedModelWrapper(nn.Module):
                 unsupported_kwargs[key] = value
 
             if check_peft_kwargs:
-                if key in prepare_model_for_int8_training.__code__.co_varnames:
+                if key in prepare_model_for_kbit_training.__code__.co_varnames:
                     peft_kwargs[key] = value
                     if key in unsupported_kwargs:
                         unsupported_kwargs.pop(key)
 
         return supported_kwargs, unsupported_kwargs, peft_kwargs
+
+    @classmethod
+    def add_and_load_reward_modeling_adapter(
+        cls, pretrained_model, adapter_model_id, adapter_name="reward_model_adapter", token=None
+    ):
+        r"""
+        Add and load a reward modeling adapter. This method can only be used if the
+        model is a `PeftModel` and if you have initialized the model with the `reward_modeling_adapter_id`
+        argument, pointing to the id of the reward modeling adapter. The latest needs also to contain the
+        score head in order to produce the reward.
+        """
+        pretrained_model.load_adapter(adapter_model_id, adapter_name, is_trainable=False)
+        pretrained_model.train()
+
+        filename = os.path.join(adapter_model_id, "adapter_model.bin")
+        if not os.path.exists(filename):
+            try:
+                local_filename = hf_hub_download(
+                    adapter_model_id,
+                    "adapter_model.bin",
+                    token=token,
+                )
+            except:  # noqa
+                raise ValueError(
+                    "Could not find adapter model in the Hub, make sure you have the correct adapter model id."
+                )
+        else:
+            local_filename = filename
+
+        adapter_state_dict = torch.load(local_filename, map_location="cpu")
+
+        for score_name_candidate in cls.supported_rm_modules:
+            if any([score_name_candidate in name for name in adapter_state_dict.keys()]):
+                score_name = score_name_candidate
+                # we have found the correct head name and can break
+                break
+
+        score_dict = {}
+
+        for name, param in adapter_state_dict.items():
+            if score_name in name:
+                key_name = ".".join(name.split(".")[-1:])
+                score_dict[key_name] = param.to(cls._get_current_device())
+
+        num_labels, hidden_dim = score_dict["weight"].shape
+        has_bias = any(["bias" in name for name in adapter_state_dict.keys()])
+
+        score = nn.Linear(hidden_dim, num_labels, bias=has_bias).to(
+            device=cls._get_current_device(),
+            dtype=pretrained_model.dtype,
+        )
+        score.load_state_dict(score_dict)
+        for param in score.parameters():
+            param.requires_grad = False
+
+        return score
 
     def push_to_hub(self, *args, **kwargs):
         r"""
@@ -339,7 +516,7 @@ class PreTrainedModelWrapper(nn.Module):
                 Keyword arguments passed along to the underlying model's
                 `save_pretrained` method.
         """
-        state_dict = kwargs.pop("state_dict", None)
+        state_dict = kwargs.get("state_dict")
         if state_dict is None:
             state_dict = self.state_dict()
             kwargs["state_dict"] = state_dict
@@ -368,6 +545,36 @@ class PreTrainedModelWrapper(nn.Module):
         """
         raise NotImplementedError
 
+    def compute_reward_score(self, input_ids, attention_mask=None, **kwargs):
+        r"""
+        Computes the reward score for a given input. The method has first to enable the adapter
+        and then compute the reward score. After that the model disables the reward modeling
+        adapter and enables the default ppo adapter again.
+        """
+        if not self.supports_rm_adapter:
+            raise ValueError("This model does not support reward modeling adapter.")
+
+        # enable rm adapter
+        self.pretrained_model.set_adapter(self.rm_adapter_name)
+        self.pretrained_model.eval()
+
+        with torch.no_grad():
+            base_model_output = self.pretrained_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                **kwargs,
+            )
+
+            last_hidden_states = base_model_output.hidden_states[-1]
+            scores = self.score(last_hidden_states)
+
+        self.pretrained_model.set_adapter(self.policy_adapter_name)
+        self.pretrained_model.eval()
+
+        return scores
+
 
 def create_reference_model(
     model: PreTrainedModelWrapper, num_shared_layers: int = None, pattern: str = None
@@ -384,6 +591,10 @@ def create_reference_model(
     Returns
         `PreTrainedModelWrapper`
     """
+    if is_deepspeed_zero3_enabled():
+        raise ValueError(
+            "DeepSpeed ZeRO-3 is enabled and is not compatible with `create_reference_model()`. Please instantiate your reference model directly with `AutoCausalLM.from_pretrained()`."
+        )
 
     parameter_names = [n for n, _ in model.named_parameters()]
     ref_model = deepcopy(model)

@@ -1,15 +1,15 @@
-.PHONY: quality style test
+.PHONY: test precommit benchmark_core benchmark_aux
 
 check_dirs := examples tests trl
 
 test:
 	python -m pytest -n auto --dist=loadfile -s -v ./tests/
 
-quality:
-	black --check --line-length 119 --target-version py38 $(check_dirs)
-	isort --check-only $(check_dirs)
-	flake8 $(check_dirs)
+precommit:
+	pre-commit run --all-files
 
-style:
-	black --line-length 119 --target-version py38 $(check_dirs)
-	isort $(check_dirs)
+benchmark_core:
+	bash ./benchmark/benchmark_core.sh
+
+benchmark_aux:
+	bash ./benchmark/benchmark_aux.sh

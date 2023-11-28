@@ -16,9 +16,9 @@ import unittest
 
 import torch
 from datasets import Dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, EvalPrediction
 
-from trl import RewardTrainer
+from trl import RewardConfig, RewardTrainer
 from trl.trainer import compute_accuracy
 
 from .testing_utils import require_peft
@@ -33,20 +33,20 @@ class RewardTrainerTester(unittest.TestCase):
         cls.tokenizer.pad_token = cls.tokenizer.eos_token
 
     def test_accuracy_metrics(self):
-        dummy_eval_predictions = (torch.FloatTensor([[0.1, 0.9], [0.9, 0.1]]), torch.LongTensor([1, 0]))
+        dummy_eval_predictions = EvalPrediction(torch.FloatTensor([[0.1, 0.9], [0.9, 0.1]]), torch.LongTensor([0, 0]))
         accuracy = compute_accuracy(dummy_eval_predictions)
-        self.assertTrue(accuracy["accuracy"] == 0.5)
+        self.assertEqual(accuracy["accuracy"], 0.5)
 
     def test_reward_trainer(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            training_args = TrainingArguments(
+            training_args = RewardConfig(
                 output_dir=tmp_dir,
                 per_device_train_batch_size=2,
                 max_steps=3,
                 remove_unused_columns=False,
                 gradient_accumulation_steps=4,
                 learning_rate=9e-1,
-                eval_steps=1,
+                evaluation_strategy="steps",
             )
 
             # fmt: off
@@ -84,13 +84,14 @@ class RewardTrainerTester(unittest.TestCase):
                 args=training_args,
                 tokenizer=self.tokenizer,
                 train_dataset=dummy_dataset,
+                eval_dataset=dummy_dataset,
             )
 
             previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
 
             trainer.train()
 
-            self.assertIsNotNone(trainer.state.log_history[0]["train_loss"])
+            self.assertIsNotNone(trainer.state.log_history[-1]["train_loss"])
 
             # check the params have changed
             for n, param in previous_trainable_params.items():
@@ -98,6 +99,9 @@ class RewardTrainerTester(unittest.TestCase):
                 # check the params have changed - ignore 0 biases
                 if param.sum() != 0:
                     self.assertFalse(torch.equal(param, new_param))
+
+            preds = trainer.predict(dummy_dataset)
+            self.assertEqual(preds.predictions.shape, (4, 2))
 
     @require_peft
     def test_reward_trainer_peft(self):
@@ -115,14 +119,14 @@ class RewardTrainerTester(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            training_args = TrainingArguments(
+            training_args = RewardConfig(
                 output_dir=tmp_dir,
                 per_device_train_batch_size=2,
-                max_steps=3,
+                max_steps=6,
                 remove_unused_columns=False,
-                gradient_accumulation_steps=4,
+                gradient_accumulation_steps=2,
                 learning_rate=9e-1,
-                eval_steps=1,
+                evaluation_strategy="steps",
             )
 
             # fmt: off
@@ -160,6 +164,7 @@ class RewardTrainerTester(unittest.TestCase):
                 args=training_args,
                 tokenizer=self.tokenizer,
                 train_dataset=dummy_dataset,
+                eval_dataset=dummy_dataset,
                 peft_config=peft_config,
             )
             previous_trainable_params = {}
@@ -177,7 +182,7 @@ class RewardTrainerTester(unittest.TestCase):
 
             trainer.train()
 
-            self.assertIsNotNone(trainer.state.log_history[0]["train_loss"])
+            self.assertIsNotNone(trainer.state.log_history[-1]["train_loss"])
 
             # check the params have changed
             for n, param in previous_trainable_params.items():
@@ -189,9 +194,12 @@ class RewardTrainerTester(unittest.TestCase):
                 new_param = trainer.model.get_parameter(n)
                 self.assertTrue(torch.allclose(param, new_param, atol=1e-12, rtol=1e-12))
 
+            preds = trainer.predict(dummy_dataset)
+            self.assertEqual(preds.predictions.shape, (4, 2))
+
     def test_reward_trainer_assert_value_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            training_args = TrainingArguments(
+            training_args = RewardConfig(
                 output_dir=tmp_dir,
                 per_device_train_batch_size=2,
                 max_steps=1,
@@ -238,7 +246,7 @@ class RewardTrainerTester(unittest.TestCase):
             with self.assertRaises(ValueError):
                 trainer.train()
 
-            training_args = TrainingArguments(
+            training_args = RewardConfig(
                 output_dir=tmp_dir,
                 per_device_train_batch_size=2,
                 max_steps=1,
@@ -252,3 +260,55 @@ class RewardTrainerTester(unittest.TestCase):
                     tokenizer=self.tokenizer,
                     train_dataset=dummy_dataset,
                 )
+
+    def test_reward_trainer_margin(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            training_args = RewardConfig(
+                output_dir=tmp_dir,
+                per_device_train_batch_size=2,
+                max_steps=3,
+                remove_unused_columns=False,
+                gradient_accumulation_steps=4,
+                learning_rate=9e-1,
+                evaluation_strategy="steps",
+            )
+
+            # fmt: off
+            dummy_dataset_dict = {
+                "input_ids_chosen": [
+                    torch.LongTensor([0, 1, 2,]),
+                ],
+                "attention_mask_chosen": [
+                    torch.LongTensor([1, 1, 1]),
+                ],
+                "input_ids_rejected": [
+                    torch.LongTensor([0, 2,]),
+                ],
+                "attention_mask_rejected": [
+                    torch.LongTensor([1, 1]),
+                ],
+                "margin": [
+                    torch.FloatTensor([1.0]),
+                ]
+            }
+            # fmt: on
+            dummy_dataset = Dataset.from_dict(dummy_dataset_dict)
+
+            trainer = RewardTrainer(
+                model=self.model,
+                args=training_args,
+                tokenizer=self.tokenizer,
+                train_dataset=dummy_dataset,
+                eval_dataset=dummy_dataset,
+            )
+
+            batch = [dummy_dataset[0]]
+            batch = trainer.data_collator(batch)
+            loss, outputs = trainer.compute_loss(trainer.model, batch, return_outputs=True)
+
+            self.assertAlmostEqual(
+                loss,
+                -torch.nn.functional.logsigmoid(
+                    outputs["rewards_chosen"] - outputs["rewards_rejected"] - batch["margin"]
+                ).mean(),
+            )
