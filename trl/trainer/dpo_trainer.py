@@ -330,9 +330,10 @@ class DPOTrainer(Trainer):
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
         # tokenize the dataset
-        train_dataset = train_dataset.map(self.tokenize_row)
+        import os
+        train_dataset = train_dataset.map(self.tokenize_row, num_proc=os.cpu_count()//2)
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(self.tokenize_row)
+            eval_dataset = eval_dataset.map(self.tokenize_row, num_proc=os.cpu_count()//2)
 
         super().__init__(
             model=model,
