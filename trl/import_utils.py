@@ -75,7 +75,7 @@ def is_wandb_available() -> bool:
 
 
 def is_xpu_available() -> bool:
-    if is_accelerate_greater_20_0:
+    if is_accelerate_greater_20_0():
         import accelerate
 
         return accelerate.utils.is_xpu_available()
@@ -88,3 +88,14 @@ def is_xpu_available() -> bool:
             return hasattr(torch, "xpu") and torch.xpu.is_available()
         except RuntimeError:
             return False
+
+
+def is_npu_available() -> bool:
+    """Checks if `torch_npu` is installed and potentially if a NPU is in the environment"""
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("torch_npu") is None:
+        return False
+
+    import torch
+    import torch_npu  # noqa: F401
+
+    return hasattr(torch, "npu") and torch.npu.is_available()
