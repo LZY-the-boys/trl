@@ -331,6 +331,7 @@ class DPOTrainer(Trainer):
 
         # tokenize the dataset
         import os
+        print('>>> map dataset')
         train_dataset = train_dataset.map(self.tokenize_row, num_proc=os.cpu_count()//2)
         if eval_dataset is not None:
             eval_dataset = eval_dataset.map(self.tokenize_row, num_proc=os.cpu_count()//2)
